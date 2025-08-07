@@ -9,7 +9,6 @@ int main(int argc, char *argv[]) {
 
     int port = 12345; // 定义服务器监听的端口
     if (server.startServer(port)) {
-        qInfo() << "聊天服务器已在端口" << port << "上启动。等待客户端连接...";
     } else {
         qCritical() << "未能启动聊天服务器，端口为" << port << "。程序将退出。";
         return 1; // 服务器启动失败，程序退出

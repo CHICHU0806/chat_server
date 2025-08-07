@@ -12,6 +12,7 @@
 #include <QJsonDocument>  // 用于 JSON 文档处理
 #include <QJsonObject>    // 用于 JSON 对象处理
 #include <QDebug>         // 用于调试输出
+#include <QDateTime>      //
 
 class ChatServer : public QObject {
     Q_OBJECT // 启用 Qt 的元对象系统，让类可以使用信号和槽
@@ -60,7 +61,8 @@ private:
     // 处理登录请求的逻辑
     void handleLoginRequest(QTcpSocket* socket, const QString& account, const QString& password);
 
-    // TODO: 如果有聊天消息功能，这里可以添加 handleChatMessage 等
+    // 处理聊天消息请求的逻辑
+    void handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content);
 };
 
 #endif // CHAT_SERVER_H

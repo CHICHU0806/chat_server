@@ -166,7 +166,6 @@ void ChatServer::onReadyRead() {
 
         QJsonObject request = doc.object();
         QString requestType = request["type"].toString();
-        QString username = request["username"].toString();
         QString account = request["account"].toString();
         QString password = request["password"].toString();
 
@@ -174,20 +173,12 @@ void ChatServer::onReadyRead() {
 
         // **核心修正：使用明确的 else if 结构来处理不同类型的请求**
         if (requestType == "register") {
+            QString username = request["username"].toString();
             handleRegisterRequest(senderSocket, username, account, password);
         } else if (requestType == "login") {
             handleLoginRequest(senderSocket, account, password);
         } else if (requestType == "chatMessage") {
-            // TODO: 在这里实现 handleChatMessage 逻辑
-            QString content = request["content"].toString();
-            qInfo() << "收到聊天消息请求：来自 " << account << " 的消息： " << content;
-            // 示例：回复一个接收成功的消息
-            QJsonObject response;
-            response["type"] = "chatMessage";
-            response["status"] = "success";
-            response["message"] = "服务器已接收消息。";
-            sendResponse(senderSocket, response);
-            qInfo() << "已发送聊天消息接收响应给 [" << getPeerInfo(senderSocket) << "]";
+            handleChatMessage(senderSocket, account, request["content"].toString());
         }
         else {
             // 未知的请求类型
@@ -293,14 +284,28 @@ void ChatServer::handleRegisterRequest(QTcpSocket* socket, const QString& userna
         return;
     }
 
+    //检查昵称是否重复
+    QSqlQuery checkUsernameQuery(m_db);
+    checkUsernameQuery.prepare("SELECT username FROM Users WHERE username = :username");
+    checkUsernameQuery.bindValue(":username", username);
+
+    if (checkUsernameQuery.exec() && checkUsernameQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "注册失败：昵称 '" + username + "' 已存在。";
+        sendResponse(socket, response);
+        qWarning() << "注册失败：昵称重复：" << username;
+        return;
+    }
+
+    //检查账号是否重复
     QSqlQuery checkQuery(m_db);
     checkQuery.prepare("SELECT account FROM Users WHERE account = :account");
     checkQuery.bindValue(":account", account);
 
     if (checkQuery.exec() && checkQuery.next()) {
         response["status"] = "error";
-        response["message"] = "注册失败：用户名 '" + account + "' 已存在。";
-        qWarning() << "注册失败：用户名重复：" << account;
+        response["message"] = "注册失败：账号 '" + account + "' 已存在。";
+        qWarning() << "注册失败：账号重复：" << account;
     } else {
         QSqlQuery insertQuery(m_db);
         insertQuery.prepare("INSERT INTO Users (username, account, password) VALUES (:username, :account, :password)");
@@ -346,4 +351,80 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
     }
     sendResponse(socket, response);
     qInfo() << "已发送登录响应给 [" << getPeerInfo(socket) << "]";
+}
+
+// **辅助函数：处理聊天消息请求的逻辑**
+void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content) {
+    QJsonObject response;
+    response["type"] = "chatMessage";
+
+    // 验证输入数据
+    if (account.isEmpty() || content.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "聊天消息发送失败：账号和消息内容不能为空。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        qWarning() << "聊天消息发送失败：输入数据不完整";
+        return;
+    }
+
+    // 验证用户是否存在
+    QSqlQuery checkQuery(m_db);
+    checkQuery.prepare("SELECT username FROM Users WHERE account = :account COLLATE NOCASE");
+    checkQuery.bindValue(":account", account);
+
+    qDebug() << "DEBUG: 查询账号：" << account;
+    qDebug() << "DEBUG: 执行查询：" << checkQuery.executedQuery();
+
+    if (!checkQuery.exec()) {
+        qDebug() << "DEBUG: 查询执行失败，错误：" << checkQuery.lastError().text();
+        response["status"] = "error";
+        response["message"] = "聊天消息发送失败：数据库查询错误。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        return;
+    }
+
+    if (!checkQuery.next()) {
+        qDebug() << "DEBUG: 未找到账号：" << account;
+        response["status"] = "error";
+        response["message"] = "聊天消息发送失败：用户不存在。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        qWarning() << "聊天消息发送失败：用户不存在：" << account;
+        return;
+    }
+
+    // 获取数据库中的用户名
+    QString username = checkQuery.value("username").toString();
+
+    // 记录聊天消息（可选：保存到数据库）
+    qInfo() << "收到聊天消息：来自用户" << username << "(" << account << ")的消息：" << content;
+
+    // 构建广播消息
+    QJsonObject broadcastMessage;
+    broadcastMessage["type"] = "chatMessage";
+    broadcastMessage["status"] = "broadcast";
+    broadcastMessage["sender"] = account;
+    broadcastMessage["username"] = username;
+    broadcastMessage["content"] = content;
+    broadcastMessage["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 向所有在线客户端广播消息
+    int broadcastCount = 0;
+    for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
+        QTcpSocket* clientSocket = it.key();
+        if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
+            sendResponse(clientSocket, broadcastMessage);
+            broadcastCount++;
+        }
+    }
+
+    // 向发送者确认消息已处理
+    response["status"] = "success";
+    response["message"] = "消息已发送给 " + QString::number(broadcastCount) + " 个在线用户。";
+    response["timestamp"] = broadcastMessage["timestamp"];
+    sendResponse(socket, response);
+
+    qInfo() << "聊天消息已广播给" << broadcastCount << "个在线客户端，来自用户：" << username << "(" << account << ")";
 }
