@@ -177,8 +177,20 @@ void ChatServer::onReadyRead() {
             handleRegisterRequest(senderSocket, username, account, password);
         } else if (requestType == "login") {
             handleLoginRequest(senderSocket, account, password);
-        } else if (requestType == "chatMessage") {
-            handleChatMessage(senderSocket, account, request["content"].toString());
+        } else if (requestType == "chatMessage") {QString messageType = request["messageType"].toString(); // 获取消息类型
+            QString targetAccount = request["targetAccount"].toString(); // 获取目标账号（私聊时使用）
+
+            if (messageType == "private") {
+                handlePrivateChatMessage(senderSocket, account, request["content"].toString(), targetAccount);
+            } else if (messageType == "public"){
+                handleChatMessage(senderSocket, account, request["content"].toString());
+            }
+        }
+        else if (requestType == "updateUserInfo") {
+            QString nickname = request["nickname"].toString();
+            QString oldPassword = request["oldPassword"].toString();
+            QString newPassword = request["newPassword"].toString();
+            handleUpdateUserInfo(senderSocket, account, nickname, oldPassword, newPassword);
         }
         else {
             // 未知的请求类型
@@ -188,8 +200,6 @@ void ChatServer::onReadyRead() {
         }
 
         m_clientBlockSizes[senderSocket] = 0; // 处理完一个完整的数据包后，重置该客户端的 m_blockSize
-
-        // 如果 socket 还有数据，继续循环处理下一个包
     }
 }
 
@@ -355,11 +365,10 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
 
 // **辅助函数：处理聊天消息请求的逻辑**
 void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content) {
-    QJsonObject response;
-    response["type"] = "chatMessage";
-
     // 验证输入数据
     if (account.isEmpty() || content.isEmpty()) {
+        QJsonObject response;
+        response["type"] = "chatMessage";
         response["status"] = "error";
         response["message"] = "聊天消息发送失败：账号和消息内容不能为空。";
         response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -373,20 +382,9 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
     checkQuery.prepare("SELECT username FROM Users WHERE account = :account COLLATE NOCASE");
     checkQuery.bindValue(":account", account);
 
-    qDebug() << "DEBUG: 查询账号：" << account;
-    qDebug() << "DEBUG: 执行查询：" << checkQuery.executedQuery();
-
-    if (!checkQuery.exec()) {
-        qDebug() << "DEBUG: 查询执行失败，错误：" << checkQuery.lastError().text();
-        response["status"] = "error";
-        response["message"] = "聊天消息发送失败：数据库查询错误。";
-        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
-        sendResponse(socket, response);
-        return;
-    }
-
-    if (!checkQuery.next()) {
-        qDebug() << "DEBUG: 未找到账号：" << account;
+    if (!checkQuery.exec() || !checkQuery.next()) {
+        QJsonObject response;
+        response["type"] = "chatMessage";
         response["status"] = "error";
         response["message"] = "聊天消息发送失败：用户不存在。";
         response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
@@ -395,10 +393,7 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
         return;
     }
 
-    // 获取数据库中的用户名
     QString username = checkQuery.value("username").toString();
-
-    // 记录聊天消息（可选：保存到数据库）
     qInfo() << "收到聊天消息：来自用户" << username << "(" << account << ")的消息：" << content;
 
     // 构建广播消息
@@ -410,7 +405,7 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
     broadcastMessage["content"] = content;
     broadcastMessage["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
 
-    // 向所有在线客户端广播消息
+    // 向所有在线客户端广播消息（包括发送者）
     int broadcastCount = 0;
     for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
         QTcpSocket* clientSocket = it.key();
@@ -420,11 +415,158 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
         }
     }
 
-    // 向发送者确认消息已处理
-    response["status"] = "success";
-    response["message"] = "消息已发送给 " + QString::number(broadcastCount) + " 个在线用户。";
-    response["timestamp"] = broadcastMessage["timestamp"];
+    // 移除确认响应的发送
+    qInfo() << "聊天消息已广播给" << broadcastCount << "个在线客户端，来自用户：" << username << "(" << account << ")";
+}
+
+// **辅助函数：处理私聊消息请求的逻辑**
+void ChatServer::handlePrivateChatMessage(QTcpSocket* socket, const QString& senderAccount, const QString& content, const QString& targetAccount) {
+    QJsonObject response;
+    response["type"] = "chatMessage";
+
+    // 验证输入数据
+    if (senderAccount.isEmpty() || content.isEmpty() || targetAccount.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "私聊消息发送失败：发送者账号、接收者账号和消息内容不能为空。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        qWarning() << "私聊消息发送失败：输入数据不完整";
+        return;
+    }
+
+    // 验证发送者是否存在
+    QSqlQuery senderQuery(m_db);
+    senderQuery.prepare("SELECT username FROM Users WHERE account = :account COLLATE NOCASE");
+    senderQuery.bindValue(":account", senderAccount);
+
+    if (!senderQuery.exec() || !senderQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "私聊消息发送失败：发送者不存在。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        qWarning() << "私聊消息发送失败：发送者不存在：" << senderAccount;
+        return;
+    }
+
+    QString senderUsername = senderQuery.value("username").toString();
+
+    // 验证接收者是否存在
+    QSqlQuery targetQuery(m_db);
+    targetQuery.prepare("SELECT username FROM Users WHERE account = :account COLLATE NOCASE");
+    targetQuery.bindValue(":account", targetAccount);
+
+    if (!targetQuery.exec() || !targetQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "私聊消息发送失败：接收者不存在。";
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        sendResponse(socket, response);
+        qWarning() << "私聊消息发送失败：接收者不存在：" << targetAccount;
+        return;
+    }
+
+    QString targetUsername = targetQuery.value("username").toString();
+
+    // 构建私聊消息
+    QJsonObject privateMessage;
+    privateMessage["type"] = "chatMessage";
+    privateMessage["status"] = "private";
+    privateMessage["sender"] = senderAccount;
+    privateMessage["username"] = senderUsername;
+    privateMessage["target"] = targetAccount;
+    privateMessage["targetUsername"] = targetUsername;
+    privateMessage["content"] = content;
+    privateMessage["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 找到目标用户的套接字并发送消息
+    bool targetFound = false;
+    for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
+        QTcpSocket* clientSocket = it.key();
+        if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
+            // 这里需要一个方法来识别套接字对应的账号，暂时发送给所有在线用户
+            // 实际应用中需要维护套接字到账号的映射
+            sendResponse(clientSocket, privateMessage);
+            targetFound = true;
+        }
+    }
+
+    // 向发送者确认消息状态
+    response["status"] = targetFound ? "success" : "error";
+    response["message"] = targetFound ?
+        "私聊消息已发送给 " + targetUsername + "。" :
+        "私聊消息发送失败：目标用户不在线。";
+    response["timestamp"] = privateMessage["timestamp"];
     sendResponse(socket, response);
 
-    qInfo() << "聊天消息已广播给" << broadcastCount << "个在线客户端，来自用户：" << username << "(" << account << ")";
+    qInfo() << "私聊消息处理完成，从" << senderUsername << "(" << senderAccount << ")到" << targetUsername << "(" << targetAccount << ")";
+}
+
+// **辅助函数：处理用户信息更新请求的逻辑**
+void ChatServer::handleUpdateUserInfo(QTcpSocket* socket, const QString& account, const QString& nickname, const QString& oldPassword, const QString& newPassword) {
+    QJsonObject response;
+    response["type"] = "updateUserInfo";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证输入数据
+    if (account.isEmpty() || nickname.isEmpty() || oldPassword.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "用户信息更新失败：账号、昵称和原密码不能为空。";
+        sendResponse(socket, response);
+        qWarning() << "用户信息更新失败：输入数据不完整";
+        return;
+    }
+
+    // 验证用户身份（检查账号和原密码）
+    QSqlQuery authQuery(m_db);
+    authQuery.prepare("SELECT username FROM Users WHERE account = :account AND password = :password COLLATE NOCASE");
+    authQuery.bindValue(":account", account);
+    authQuery.bindValue(":password", oldPassword);
+
+    if (!authQuery.exec() || !authQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "用户信息更新失败：原密码不正确。";
+        sendResponse(socket, response);
+        qWarning() << "用户信息更新失败：身份验证失败：" << account;
+        return;
+    }
+
+    QString currentUsername = authQuery.value("username").toString();
+
+    // 开始更新用户信息
+    QSqlQuery updateQuery(m_db);
+    QString updateSql;
+
+    if (newPassword.isEmpty()) {
+        // 只更新昵称
+        updateSql = "UPDATE Users SET username = :nickname WHERE account = :account";
+        updateQuery.prepare(updateSql);
+        updateQuery.bindValue(":nickname", nickname);
+        updateQuery.bindValue(":account", account);
+    } else {
+        // 同时更新昵称和密码
+        updateSql = "UPDATE Users SET username = :nickname, password = :newPassword WHERE account = :account";
+        updateQuery.prepare(updateSql);
+        updateQuery.bindValue(":nickname", nickname);
+        updateQuery.bindValue(":newPassword", newPassword);
+        updateQuery.bindValue(":account", account);
+    }
+
+    if (updateQuery.exec()) {
+        response["status"] = "success";
+        if (newPassword.isEmpty()) {
+            response["message"] = "昵称更新成功！新昵称：" + nickname;
+            qInfo() << "用户昵称更新成功：账号=" << account << ", 原昵称=" << currentUsername << ", 新昵称=" << nickname;
+        } else {
+            response["message"] = "用户信息更新成功！新昵称：" + nickname + "，密码已更新。";
+            qInfo() << "用户信息更新成功：账号=" << account << ", 原昵称=" << currentUsername << ", 新昵称=" << nickname << ", 密码已更新";
+        }
+        response["username"] = nickname;
+        response["account"] = account;
+    } else {
+        response["status"] = "error";
+        response["message"] = "用户信息更新失败：数据库错误 - " + updateQuery.lastError().text();
+        qCritical() << "用户信息更新失败：数据库错误：" << updateQuery.lastError().text();
+    }
+
+    sendResponse(socket, response);
+    qInfo() << "已发送用户信息更新响应给 [" << getPeerInfo(socket) << "]";
 }

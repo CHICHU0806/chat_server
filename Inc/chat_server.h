@@ -63,6 +63,12 @@ private:
 
     // 处理聊天消息请求的逻辑
     void handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content);
+
+    // 处理私聊
+    void handlePrivateChatMessage(QTcpSocket* socket, const QString& senderAccount, const QString& content, const QString& targetAccount);
+
+    // 处理个人信息更新
+    void handleUpdateUserInfo(QTcpSocket* socket, const QString& account, const QString& nickname, const QString& oldPassword, const QString& newPassword);
 };
 
 #endif // CHAT_SERVER_H
