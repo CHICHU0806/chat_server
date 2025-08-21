@@ -96,7 +96,7 @@ void ChatServer::stopServer() {
     for (QTcpSocket* clientSocket : clientSocketsToClose) {
         if (clientSocket->state() == QAbstractSocket::ConnectedState) {
             clientSocket->disconnectFromHost(); // 向客户端发送断开连接请求
-            // 这里不立即 deleteLater()，依赖 onDisconnected() 槽来安全清理
+            //这里不立即 deleteLater()，依赖 onDisconnected() 槽来安全清理
         }
     }
     // 理论上所有客户端都会触发 onDisconnected，导致 m_clientBlockSizes 被清空
@@ -192,6 +192,10 @@ void ChatServer::onReadyRead() {
             QString newPassword = request["newPassword"].toString();
             handleUpdateUserInfo(senderSocket, account, nickname, oldPassword, newPassword);
         }
+        else if (requestType == "searchFriend") {
+            QString targetAccount = request["targetAccount"].toString();
+            handleSearchFriend(senderSocket, account, targetAccount);
+        }
         else {
             // 未知的请求类型
             QString errorMessage = "服务器无法处理该请求类型：" + requestType;
@@ -210,6 +214,13 @@ void ChatServer::onDisconnected() {
     if (!senderSocket) {
         qWarning() << "onDisconnected: 无法获取发送信号的套接字！";
         return;
+    }
+
+    // 清理账号映射
+    if (m_socketToAccount.contains(senderSocket)) {
+        QString account = m_socketToAccount.value(senderSocket);
+        m_socketToAccount.remove(senderSocket);
+        qInfo() << "用户 " << account << " 已下线";
     }
 
     qInfo() << "客户端 [" << getPeerInfo(senderSocket) << "] 已断开连接。";
@@ -350,6 +361,9 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
 
     if (query.exec() && query.next()) {
         QString username = query.value("username").toString();
+
+        m_socketToAccount[socket] = account;        // 建立socket到account的映射
+
         response["status"] = "success";
         response["message"] = "登录成功！欢迎 " + username + "！";
         response["username"] = username;
@@ -569,4 +583,76 @@ void ChatServer::handleUpdateUserInfo(QTcpSocket* socket, const QString& account
 
     sendResponse(socket, response);
     qInfo() << "已发送用户信息更新响应给 [" << getPeerInfo(socket) << "]";
+}
+
+// **辅助函数：处理搜索好友请求的逻辑**
+void ChatServer::handleSearchFriend(QTcpSocket* socket, const QString& account, const QString& targetAccount) {
+    QJsonObject response;
+    response["type"] = "searchFriend";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 检查是否搜索自己
+    if (account == targetAccount) {
+        response["status"] = "error";
+        response["message"] = "不能添加自己为好友";
+        sendResponse(socket, response);
+        qWarning() << "搜索好友失败：用户尝试搜索自己：" << account;
+        return;
+    }
+
+    // 验证当前用户是否存在
+    QSqlQuery currentUserQuery(m_db);
+    currentUserQuery.prepare("SELECT username FROM Users WHERE account = :account COLLATE NOCASE");
+    currentUserQuery.bindValue(":account", account);
+
+    if (!currentUserQuery.exec() || !currentUserQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "搜索失败：当前用户不存在。";
+        sendResponse(socket, response);
+        qWarning() << "搜索好友失败：当前用户不存在：" << account;
+        return;
+    }
+
+    // 搜索目标用户
+    QSqlQuery targetUserQuery(m_db);
+    targetUserQuery.prepare("SELECT username FROM Users WHERE account = :targetAccount COLLATE NOCASE");
+    targetUserQuery.bindValue(":targetAccount", targetAccount);
+
+    if (!targetUserQuery.exec() || !targetUserQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "用户不存在";
+        sendResponse(socket, response);
+        qInfo() << "搜索好友：用户不存在 - 搜索者:" << account << ", 目标:" << targetAccount;
+        return;
+    }
+
+    QString targetUsername = targetUserQuery.value("username").toString();
+
+    // 检查目标用户是否在线
+    bool isOnline = m_socketToAccount.values().contains(targetAccount);
+    for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+        QTcpSocket* clientSocket = it.key();
+        QString clientAccount = it.value();
+
+        if (clientSocket &&
+            clientSocket->state() == QAbstractSocket::ConnectedState &&
+            clientAccount == targetAccount) {
+            isOnline = true;
+            break;
+        }
+    }
+
+    // 构建成功响应
+    response["status"] = "success";
+    response["message"] = "用户找到";
+
+    QJsonObject userInfo;
+    userInfo["account"] = targetAccount;
+    userInfo["username"] = targetUsername;
+    userInfo["isOnline"] = isOnline;
+    //TODO:头像相关内容
+    response["userInfo"] = userInfo;
+
+    sendResponse(socket, response);
+    qInfo() << "搜索好友成功：搜索者=" << account << ", 找到用户=" << targetUsername << "(" << targetAccount << ")";
 }

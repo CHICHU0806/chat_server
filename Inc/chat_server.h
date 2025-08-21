@@ -42,6 +42,7 @@ private slots:
 private:
     QTcpServer *m_tcpServer;           // 用于监听客户端连接的服务器对象
     QHash<QTcpSocket*, quint32> m_clientBlockSizes; // 存储每个客户端的数据包大小
+    QHash<QTcpSocket*, QString> m_socketToAccount; // socket到账号的映射
 
     QSqlDatabase m_db; // 数据库连接对象
 
@@ -69,6 +70,9 @@ private:
 
     // 处理个人信息更新
     void handleUpdateUserInfo(QTcpSocket* socket, const QString& account, const QString& nickname, const QString& oldPassword, const QString& newPassword);
+
+    // 处理搜索好友请求
+    void handleSearchFriend(QTcpSocket* socket, const QString& account, const QString& targetAccount);
 };
 
 #endif // CHAT_SERVER_H
