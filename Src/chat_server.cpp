@@ -628,6 +628,7 @@ void ChatServer::handleSearchFriend(QTcpSocket* socket, const QString& account, 
 
     QString targetUsername = targetUserQuery.value("username").toString();
 
+
     // 检查目标用户是否在线
     bool isOnline = m_socketToAccount.values().contains(targetAccount);
     for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
