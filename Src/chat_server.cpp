@@ -53,6 +53,73 @@ ChatServer::ChatServer(QObject *parent)
         } else {
             qInfo() << "服务器 Users 表已准备好。";
         }
+        // 创建消息表
+        QString createMessageTableSql = "CREATE TABLE IF NOT EXISTS Messages ("
+                                       "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                                       "sender_account TEXT NOT NULL,"
+                                       "receiver_account TEXT,"  // NULL表示公共消息
+                                       "content TEXT NOT NULL,"
+                                       "message_type TEXT NOT NULL,"  // 'public' 或 'private'
+                                       "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                       "is_read BOOLEAN DEFAULT FALSE,"
+                                       "FOREIGN KEY (sender_account) REFERENCES Users(account),"
+                                       "FOREIGN KEY (receiver_account) REFERENCES Users(account)"
+                                       ");";
+
+        if (!query.exec(createMessageTableSql)) {
+            qCritical() << "服务器无法创建 Messages 表：" << query.lastError().text();
+        } else {
+            qInfo() << "服务器 Messages 表已准备好。";
+        }
+
+        // 创建用户状态表
+        QString createUserStatusTableSql = "CREATE TABLE IF NOT EXISTS UserStatus ("
+                                          "account TEXT PRIMARY KEY,"
+                                          "last_online DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                          "last_message_sync DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                          "is_online BOOLEAN DEFAULT FALSE,"
+                                          "FOREIGN KEY (account) REFERENCES Users(account)"
+                                          ");";
+
+        if (!query.exec(createUserStatusTableSql)) {
+            qCritical() << "服务器无法创建 UserStatus 表：" << query.lastError().text();
+        } else {
+            qInfo() << "服务器 UserStatus 表已准备好。";
+        }
+
+        // 创建消息已读状态表（用于公共消息的已读跟踪）
+        QString createMessageReadStatusTableSql = "CREATE TABLE IF NOT EXISTS MessageReadStatus ("
+                                                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                                                 "message_id INTEGER NOT NULL,"
+                                                 "user_account TEXT NOT NULL,"
+                                                 "read_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                                 "FOREIGN KEY (message_id) REFERENCES Messages(id),"
+                                                 "FOREIGN KEY (user_account) REFERENCES Users(account),"
+                                                 "UNIQUE(message_id, user_account)"
+                                                 ");";
+
+        if (!query.exec(createMessageReadStatusTableSql)) {
+            qCritical() << "服务器无法创建 MessageReadStatus 表：" << query.lastError().text();
+        } else {
+            qInfo() << "服务器 MessageReadStatus 表已准备好。";
+        }
+
+        // 创建索引以提高查询性能
+        QStringList indexQueries = {
+            "CREATE INDEX IF NOT EXISTS idx_messages_receiver_timestamp ON Messages(receiver_account, timestamp);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_sender_timestamp ON Messages(sender_account, timestamp);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_type_timestamp ON Messages(message_type, timestamp);",
+            "CREATE INDEX IF NOT EXISTS idx_user_status_last_sync ON UserStatus(last_message_sync);",
+            "CREATE INDEX IF NOT EXISTS idx_message_read_status ON MessageReadStatus(message_id, user_account);"
+        };
+
+        for (const QString& indexSql : indexQueries) {
+            if (!query.exec(indexSql)) {
+                qWarning() << "创建索引失败：" << query.lastError().text() << "SQL:" << indexSql;
+            }
+        }
+
+        qInfo() << "数据库索引创建完成。";
     }
     //数据库设置结束
 
@@ -177,12 +244,12 @@ void ChatServer::onReadyRead() {
             handleRegisterRequest(senderSocket, username, account, password);
         } else if (requestType == "login") {
             handleLoginRequest(senderSocket, account, password);
-        } else if (requestType == "chatMessage") {QString messageType = request["messageType"].toString(); // 获取消息类型
+        } else if (requestType == "chatMessage") {
+            QString chatType = request["chatType"].toString(); // 改为 chatType
             QString targetAccount = request["targetAccount"].toString(); // 获取目标账号（私聊时使用）
-
-            if (messageType == "private") {
+            if (chatType == "private") {
                 handlePrivateChatMessage(senderSocket, account, request["content"].toString(), targetAccount);
-            } else if (messageType == "public"){
+            } else if (chatType == "public"){
                 handleChatMessage(senderSocket, account, request["content"].toString());
             }
         }
@@ -219,6 +286,10 @@ void ChatServer::onDisconnected() {
     // 清理账号映射
     if (m_socketToAccount.contains(senderSocket)) {
         QString account = m_socketToAccount.value(senderSocket);
+
+        // 更新用户离线状态
+        updateUserOnlineStatus(account, false);
+
         m_socketToAccount.remove(senderSocket);
         qInfo() << "用户 " << account << " 已下线";
     }
@@ -362,13 +433,22 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
     if (query.exec() && query.next()) {
         QString username = query.value("username").toString();
 
-        m_socketToAccount[socket] = account;        // 建立socket到account的映射
+        // 登录成功，初始化用户状态
+        initializeUserStatus(account);
 
         response["status"] = "success";
-        response["message"] = "登录成功！欢迎 " + username + "！";
+        response["message"] = "登录成功";
         response["username"] = username;
-        qInfo() << "用户登录成功：账号=" << account << ", 昵称=" << username << " from " << getPeerInfo(socket);
-    } else {
+        response["account"] = account;
+
+        // 将套接字与账号关联
+        m_socketToAccount.insert(socket, account);
+
+        // 推送离线消息
+        pushOfflineMessages(socket, account);
+
+        qInfo() << "登录成功：" << username << "(" << account << ") 来自 [" << getPeerInfo(socket) << "]";
+    }else {
         response["status"] = "error";
         response["message"] = "登录失败：账号或密码不正确。";
         qWarning() << "用户登录失败：账号=" << account << ", 密码=" << password << " from " << getPeerInfo(socket);
@@ -410,6 +490,9 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
     QString username = checkQuery.value("username").toString();
     qInfo() << "收到聊天消息：来自用户" << username << "(" << account << ")的消息：" << content;
 
+    // 保存公共消息到数据库
+    saveMessageToDatabase(account, "", content, "public");
+
     // 构建广播消息
     QJsonObject broadcastMessage;
     broadcastMessage["type"] = "chatMessage";
@@ -429,7 +512,14 @@ void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, c
         }
     }
 
-    // 移除确认响应的发送
+    // 向发送者发送确认响应
+    QJsonObject confirmResponse;
+    confirmResponse["type"] = "chatMessage";
+    confirmResponse["status"] = "success";
+    confirmResponse["message"] = "消息发送成功，已广播给 " + QString::number(broadcastCount) + " 个在线用户";
+    confirmResponse["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    sendResponse(socket, confirmResponse);
+
     qInfo() << "聊天消息已广播给" << broadcastCount << "个在线客户端，来自用户：" << username << "(" << account << ")";
 }
 
@@ -479,6 +569,9 @@ void ChatServer::handlePrivateChatMessage(QTcpSocket* socket, const QString& sen
     }
 
     QString targetUsername = targetQuery.value("username").toString();
+
+    // 保存私聊消息到数据库
+    saveMessageToDatabase(senderAccount, targetAccount, content, "private");
 
     // 构建私聊消息
     QJsonObject privateMessage;
@@ -655,4 +748,187 @@ void ChatServer::handleSearchFriend(QTcpSocket* socket, const QString& account, 
 
     sendResponse(socket, response);
     qInfo() << "搜索好友成功：搜索者=" << account << ", 找到用户=" << targetUsername << "(" << targetAccount << ")";
+}
+
+// 保存消息到数据库
+void ChatServer::saveMessageToDatabase(const QString& senderAccount, const QString& receiverAccount,
+                                     const QString& content, const QString& messageType) {
+    QSqlQuery insertQuery(m_db);
+    insertQuery.prepare("INSERT INTO Messages (sender_account, receiver_account, content, message_type, timestamp) "
+                       "VALUES (:sender, :receiver, :content, :type, :timestamp)");
+
+    insertQuery.bindValue(":sender", senderAccount);
+    insertQuery.bindValue(":receiver", receiverAccount.isEmpty() ? QVariant() : receiverAccount);
+    insertQuery.bindValue(":content", content);
+    insertQuery.bindValue(":type", messageType);
+    insertQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+
+    if (!insertQuery.exec()) {
+        qCritical() << "保存消息到数据库失败：" << insertQuery.lastError().text();
+    } else {
+        qDebug() << "消息已保存到数据库：" << messageType << "类型，发送者：" << senderAccount;
+    }
+}
+
+// 更新用户在线状态
+void ChatServer::updateUserOnlineStatus(const QString& account, bool isOnline) {
+    QSqlQuery updateQuery(m_db);
+
+    if (isOnline) {
+        // 用户上线
+        updateQuery.prepare("INSERT OR REPLACE INTO UserStatus (account, last_online, is_online) "
+                           "VALUES (:account, :timestamp, :online)");
+    } else {
+        // 用户下线
+        updateQuery.prepare("UPDATE UserStatus SET last_online = :timestamp, is_online = :online "
+                           "WHERE account = :account");
+    }
+
+    updateQuery.bindValue(":account", account);
+    updateQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+    updateQuery.bindValue(":online", isOnline);
+
+    if (!updateQuery.exec()) {
+        qWarning() << "更新用户状态失败：" << updateQuery.lastError().text();
+    }
+}
+
+// 更新用户最后同步时间
+void ChatServer::updateUserLastSync(const QString& account) {
+    QSqlQuery updateQuery(m_db);
+    updateQuery.prepare("UPDATE UserStatus SET last_message_sync = :timestamp WHERE account = :account");
+    updateQuery.bindValue(":account", account);
+    updateQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+
+    if (!updateQuery.exec()) {
+        qWarning() << "更新用户同步时间失败：" << updateQuery.lastError().text();
+    }
+}
+
+// 推送离线消息
+void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account) {
+    // 获取用户最后同步时间
+    QSqlQuery syncQuery(m_db);
+    syncQuery.prepare("SELECT last_message_sync FROM UserStatus WHERE account = :account");
+    syncQuery.bindValue(":account", account);
+
+    QString lastSyncTime;
+    if (syncQuery.exec() && syncQuery.next()) {
+        lastSyncTime = syncQuery.value("last_message_sync").toString();
+    } else {
+        // 如果没有同步记录，使用很早的时间来获取所有消息
+        lastSyncTime = "2000-01-01T00:00:00";
+    }
+
+    // 查询离线期间的公共消息
+    QSqlQuery publicMsgQuery(m_db);
+    publicMsgQuery.prepare("SELECT sender_account, content, timestamp "
+                          "FROM Messages "
+                          "WHERE message_type = 'public' AND timestamp > :lastSync "
+                          "ORDER BY timestamp ASC");
+    publicMsgQuery.bindValue(":lastSync", lastSyncTime);
+
+    int publicMsgCount = 0;
+    if (publicMsgQuery.exec()) {
+        while (publicMsgQuery.next()) {
+            QString senderAccount = publicMsgQuery.value("sender_account").toString();
+            QString content = publicMsgQuery.value("content").toString();
+            QString timestamp = publicMsgQuery.value("timestamp").toString();
+
+            // 获取发送者用户名
+            QSqlQuery senderQuery(m_db);
+            senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+            senderQuery.bindValue(":account", senderAccount);
+
+            QString senderUsername = senderAccount; // 默认值
+            if (senderQuery.exec() && senderQuery.next()) {
+                senderUsername = senderQuery.value("username").toString();
+            }
+
+            // 构建离线消息
+            QJsonObject offlineMessage;
+            offlineMessage["type"] = "chatMessage";
+            offlineMessage["status"] = "offline_broadcast";
+            offlineMessage["sender"] = senderAccount;
+            offlineMessage["username"] = senderUsername;
+            offlineMessage["content"] = content;
+            offlineMessage["timestamp"] = timestamp;
+
+            sendResponse(socket, offlineMessage);
+            publicMsgCount++;
+        }
+    }
+
+    // 查询离线期间的私聊消息（接收的）
+    QSqlQuery privateMsgQuery(m_db);
+    privateMsgQuery.prepare("SELECT sender_account, content, timestamp "
+                           "FROM Messages "
+                           "WHERE message_type = 'private' AND receiver_account = :account "
+                           "AND timestamp > :lastSync AND is_read = FALSE "
+                           "ORDER BY timestamp ASC");
+    privateMsgQuery.bindValue(":account", account);
+    privateMsgQuery.bindValue(":lastSync", lastSyncTime);
+
+    int privateMsgCount = 0;
+    if (privateMsgQuery.exec()) {
+        while (privateMsgQuery.next()) {
+            QString senderAccount = privateMsgQuery.value("sender_account").toString();
+            QString content = privateMsgQuery.value("content").toString();
+            QString timestamp = privateMsgQuery.value("timestamp").toString();
+
+            // 获取发送者用户名
+            QSqlQuery senderQuery(m_db);
+            senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+            senderQuery.bindValue(":account", senderAccount);
+
+            QString senderUsername = senderAccount;
+            if (senderQuery.exec() && senderQuery.next()) {
+                senderUsername = senderQuery.value("username").toString();
+            }
+
+            // 构建离线私聊消息
+            QJsonObject offlineMessage;
+            offlineMessage["type"] = "chatMessage";
+            offlineMessage["status"] = "offline_private";
+            offlineMessage["sender"] = senderAccount;
+            offlineMessage["username"] = senderUsername;
+            offlineMessage["target"] = account;
+            offlineMessage["content"] = content;
+            offlineMessage["timestamp"] = timestamp;
+
+            sendResponse(socket, offlineMessage);
+            privateMsgCount++;
+        }
+    }
+
+    // 更新用户最后同步时间
+    updateUserLastSync(account);
+
+    if (publicMsgCount > 0 || privateMsgCount > 0) {
+        qInfo() << "已推送离线消息给用户" << account << "：公共消息" << publicMsgCount << "条，私聊消息" << privateMsgCount << "条";
+    }
+}
+
+// 初始化用户状态
+void ChatServer::initializeUserStatus(const QString& account) {
+    QSqlQuery checkQuery(m_db);
+    checkQuery.prepare("SELECT account FROM UserStatus WHERE account = :account");
+    checkQuery.bindValue(":account", account);
+
+    if (checkQuery.exec() && !checkQuery.next()) {
+        // 用户状态记录不存在，创建新记录
+        QSqlQuery insertQuery(m_db);
+        insertQuery.prepare("INSERT INTO UserStatus (account, last_online, last_message_sync, is_online) "
+                           "VALUES (:account, :timestamp, :timestamp, :online)");
+        insertQuery.bindValue(":account", account);
+        insertQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+        insertQuery.bindValue(":online", true);
+
+        if (!insertQuery.exec()) {
+            qWarning() << "初始化用户状态失败：" << insertQuery.lastError().text();
+        }
+    } else {
+        // 更新现有记录
+        updateUserOnlineStatus(account, true);
+    }
 }
