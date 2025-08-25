@@ -74,6 +74,21 @@ private:
     // 处理搜索好友请求
     void handleSearchFriend(QTcpSocket* socket, const QString& account, const QString& targetAccount);
 
+    // 处理添加好友请求
+    void handleAddFriendRequest(QTcpSocket* socket, const QJsonObject& message);
+
+    // 处理获取好友申请请求
+    void handleGetFriendRequests(QTcpSocket* socket, const QString& account);
+
+    // 处理接受好友申请请求
+    void handleAcceptFriendRequest(QTcpSocket* socket, const QString& account, const QString& fromAccount);
+
+    // 处理拒绝好友申请请求
+    void handleRejectFriendRequest(QTcpSocket* socket, const QString& account, const QString& fromAccount);
+
+    // 处理获取好友列表请求
+    void handleGetFriendList(QTcpSocket* socket, const QString& account);
+
     // 消息持久化相关函数
     void saveMessageToDatabase(const QString& senderAccount, const QString& receiverAccount, const QString& content, const QString& messageType);
 
@@ -81,8 +96,17 @@ private:
     void updateUserOnlineStatus(const QString& account, bool isOnline);
     void updateUserLastSync(const QString& account);
 
+    // 处理获取离线消息请求
+    void handleGetOfflineMessages(QTcpSocket* socket, const QString& account);
+
     // 离线消息推送函数
     void pushOfflineMessages(QTcpSocket* socket, const QString& account);
+
+    // 在线好友申请函数
+    void pushFriendRequestToOnlineUser(const QString& fromAccount, const QString& fromUsername, const QString& toAccount);
+
+    // 推送离线好友申请函数
+    void pushOfflineFriendRequests(QTcpSocket* socket, const QString& account);
 
     // 初始化用户状态（登录时调用）
     void initializeUserStatus(const QString& account);

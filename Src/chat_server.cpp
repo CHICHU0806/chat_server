@@ -8,6 +8,7 @@
 #include <QSqlError>       // 确保包含
 #include <QDir>            // 用于处理文件路径和目录创建
 #include <QCoreApplication> // 用于获取应用程序路径
+#include <QJsonArray>
 
 // 构造函数：初始化成员变量，连接信号和槽
 ChatServer::ChatServer(QObject *parent)
@@ -104,13 +105,37 @@ ChatServer::ChatServer(QObject *parent)
             qInfo() << "服务器 MessageReadStatus 表已准备好。";
         }
 
+        // 创建好友关系表
+        QString createFriendshipTableSql = "CREATE TABLE IF NOT EXISTS Friendships ("
+                                          "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                                          "user_account TEXT NOT NULL,"
+                                          "friend_account TEXT NOT NULL,"
+                                          "status TEXT NOT NULL,"  // 'pending', 'accepted', 'blocked'
+                                          "created_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                          "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
+                                          "FOREIGN KEY (user_account) REFERENCES Users(account),"
+                                          "FOREIGN KEY (friend_account) REFERENCES Users(account),"
+                                          "UNIQUE(user_account, friend_account)"
+                                          ");";
+
+        if (!query.exec(createFriendshipTableSql)) {
+            qCritical() << "服务器无法创建 Friendships 表：" << query.lastError().text();
+        } else {
+            qInfo() << "服务器 Friendships 表已准备好。";
+        }
+
         // 创建索引以提高查询性能
         QStringList indexQueries = {
             "CREATE INDEX IF NOT EXISTS idx_messages_receiver_timestamp ON Messages(receiver_account, timestamp);",
             "CREATE INDEX IF NOT EXISTS idx_messages_sender_timestamp ON Messages(sender_account, timestamp);",
             "CREATE INDEX IF NOT EXISTS idx_messages_type_timestamp ON Messages(message_type, timestamp);",
             "CREATE INDEX IF NOT EXISTS idx_user_status_last_sync ON UserStatus(last_message_sync);",
-            "CREATE INDEX IF NOT EXISTS idx_message_read_status ON MessageReadStatus(message_id, user_account);"
+            "CREATE INDEX IF NOT EXISTS idx_message_read_status ON MessageReadStatus(message_id, user_account);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_is_read ON Messages(is_read);",
+            "CREATE INDEX IF NOT EXISTS idx_users_account ON Users(account);",
+            "CREATE INDEX IF NOT EXISTS idx_users_username ON Users(username);",
+            "CREATE INDEX IF NOT EXISTS idx_user_status_online ON UserStatus(is_online);",
+            "CREATE INDEX IF NOT EXISTS idx_messages_sender_receiver ON Messages(sender_account, receiver_account);"
         };
 
         for (const QString& indexSql : indexQueries) {
@@ -262,6 +287,26 @@ void ChatServer::onReadyRead() {
         else if (requestType == "searchFriend") {
             QString targetAccount = request["targetAccount"].toString();
             handleSearchFriend(senderSocket, account, targetAccount);
+        }
+        else if (requestType == "addFriend") {
+            handleAddFriendRequest(senderSocket, request);
+        }
+        else if (requestType == "getFriendRequests") {
+            handleGetFriendRequests(senderSocket, account);
+        }
+        else if (requestType == "acceptFriendRequest") {
+            QString fromAccount = request["fromAccount"].toString();
+            handleAcceptFriendRequest(senderSocket, account, fromAccount);
+        }
+        else if (requestType == "rejectFriendRequest") {
+            QString fromAccount = request["fromAccount"].toString();
+            handleRejectFriendRequest(senderSocket, account, fromAccount);
+        }
+        else if (requestType == "getFriendList") {
+            handleGetFriendList(senderSocket, account);
+        }
+        else if (requestType == "getOfflineMessages") {
+            handleGetOfflineMessages(senderSocket, account);
         }
         else {
             // 未知的请求类型
@@ -444,8 +489,9 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
         // 将套接字与账号关联
         m_socketToAccount.insert(socket, account);
 
-        // 推送离线消息
+        // 推送离线消息和离线好友申请
         pushOfflineMessages(socket, account);
+        pushOfflineFriendRequests(socket, account);
 
         qInfo() << "登录成功：" << username << "(" << account << ") 来自 [" << getPeerInfo(socket) << "]";
     }else {
@@ -453,7 +499,9 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
         response["message"] = "登录失败：账号或密码不正确。";
         qWarning() << "用户登录失败：账号=" << account << ", 密码=" << password << " from " << getPeerInfo(socket);
     }
+
     sendResponse(socket, response);
+
     qInfo() << "已发送登录响应给 [" << getPeerInfo(socket) << "]";
 }
 
@@ -750,6 +798,127 @@ void ChatServer::handleSearchFriend(QTcpSocket* socket, const QString& account, 
     qInfo() << "搜索好友成功：搜索者=" << account << ", 找到用户=" << targetUsername << "(" << targetAccount << ")";
 }
 
+// **辅助函数：处理添加好友请求的逻辑**
+void ChatServer::handleAddFriendRequest(QTcpSocket* socket, const QJsonObject& request) {
+    QString senderAccount = request["account"].toString();
+    QString targetAccount = request["targetAccount"].toString();
+
+    QJsonObject response;
+    response["type"] = "addFriend";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证输入数据
+    if (senderAccount.isEmpty() || targetAccount.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：发送者账号和目标账号不能为空。";
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：输入数据不完整";
+        return;
+    }
+
+    // 检查是否添加自己
+    if (senderAccount == targetAccount) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：不能添加自己为好友。";
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：用户尝试添加自己：" << senderAccount;
+        return;
+    }
+
+    // 验证发送者是否存在且已登录
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != senderAccount) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：用户未登录或身份验证失败。";
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：身份验证失败：" << senderAccount;
+        return;
+    }
+
+    // 获取发送者用户名
+    QSqlQuery senderQuery(m_db);
+    senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+    senderQuery.bindValue(":account", senderAccount);
+
+    if (!senderQuery.exec() || !senderQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：发送者信息获取失败。";
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：发送者信息获取失败：" << senderAccount;
+        return;
+    }
+
+    QString senderUsername = senderQuery.value("username").toString();
+
+    // 验证目标用户是否存在
+    QSqlQuery targetQuery(m_db);
+    targetQuery.prepare("SELECT username FROM Users WHERE account = :account");
+    targetQuery.bindValue(":account", targetAccount);
+
+    if (!targetQuery.exec() || !targetQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：目标用户不存在。";
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：目标用户不存在：" << targetAccount;
+        return;
+    }
+
+    QString targetUsername = targetQuery.value("username").toString();
+
+    // 检查是否已经是好友关系
+    QSqlQuery friendshipQuery(m_db);
+    friendshipQuery.prepare("SELECT status FROM Friendships WHERE "
+                           "(user_account = :sender AND friend_account = :target) OR "
+                           "(user_account = :target AND friend_account = :sender)");
+    friendshipQuery.bindValue(":sender", senderAccount);
+    friendshipQuery.bindValue(":target", targetAccount);
+
+    if (friendshipQuery.exec() && friendshipQuery.next()) {
+        QString status = friendshipQuery.value("status").toString();
+        if (status == "accepted") {
+            response["status"] = "error";
+            response["message"] = "添加好友失败：你们已经是好友了。";
+        } else if (status == "pending") {
+            response["status"] = "error";
+            response["message"] = "添加好友失败：已存在好友申请关系。";
+        } else if (status == "blocked") {
+            response["status"] = "error";
+            response["message"] = "添加好友失败：无法发送好友申请。";
+        }
+        sendResponse(socket, response);
+        qWarning() << "添加好友失败：已存在好友关系，状态：" << status << "发送者：" << senderAccount << "目标：" << targetAccount;
+        return;
+    }
+
+    // 插入好友申请记录
+    QSqlQuery insertQuery(m_db);
+    insertQuery.prepare("INSERT INTO Friendships (user_account, friend_account, status, created_at, updated_at) "
+                       "VALUES (:sender, :target, 'pending', :timestamp, :timestamp)");
+    insertQuery.bindValue(":sender", senderAccount);
+    insertQuery.bindValue(":target", targetAccount);
+    insertQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+
+    if (!insertQuery.exec()) {
+        response["status"] = "error";
+        response["message"] = "添加好友失败：数据库错误 - " + insertQuery.lastError().text();
+        sendResponse(socket, response);
+        qCritical() << "添加好友失败：数据库错误：" << insertQuery.lastError().text();
+        return;
+    }
+
+    // 发送成功响应给申请发送者
+    response["status"] = "success";
+    response["message"] = "好友申请已发送给 " + targetUsername + "。";
+    response["targetAccount"] = targetAccount;
+    response["targetUsername"] = targetUsername;
+    sendResponse(socket, response);
+
+    // 如果目标用户在线，推送好友申请通知
+    pushFriendRequestToOnlineUser(senderAccount, senderUsername, targetAccount);
+
+    qInfo() << "好友申请处理完成：" << senderUsername << "(" << senderAccount << ") 向 "
+            << targetUsername << "(" << targetAccount << ") 发送好友申请";
+}
+
 // 保存消息到数据库
 void ChatServer::saveMessageToDatabase(const QString& senderAccount, const QString& receiverAccount,
                                      const QString& content, const QString& messageType) {
@@ -803,6 +972,20 @@ void ChatServer::updateUserLastSync(const QString& account) {
     if (!updateQuery.exec()) {
         qWarning() << "更新用户同步时间失败：" << updateQuery.lastError().text();
     }
+}
+
+// 处理获取离线消息请求
+void ChatServer::handleGetOfflineMessages(QTcpSocket* socket, const QString& account) {
+    qInfo() << "处理获取离线消息请求，账号：" << account;
+
+    // 验证账号是否已登录
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != account) {
+        sendErrorResponse(socket, "未登录或账号不匹配", "getOfflineMessages");
+        return;
+    }
+
+    // 调用现有的推送离线消息函数
+    pushOfflineMessages(socket, account);
 }
 
 // 推送离线消息
@@ -909,6 +1092,72 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
     }
 }
 
+//推送在线好友申请
+void ChatServer::pushFriendRequestToOnlineUser(const QString& fromAccount, const QString& fromUsername, const QString& toAccount) {
+    // 查找目标用户的socket连接
+    for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+        if (it.value() == toAccount) {
+            QTcpSocket* targetSocket = it.key();
+
+            QJsonObject notification;
+            notification["type"] = "friendRequest";
+            notification["status"] = "onlineRequest";  // 添加状态标识
+            notification["fromAccount"] = fromAccount;
+            notification["fromUsername"] = fromUsername;
+            notification["toAccount"] = toAccount;
+            notification["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);  // 添加时间戳
+
+            sendResponse(targetSocket, notification);
+            qInfo() << "已推送好友申请通知：" << fromAccount << "(" << fromUsername << ") -> " << toAccount;
+            break;
+        }
+    }
+}
+
+// 推送离线好友申请
+void ChatServer::pushOfflineFriendRequests(QTcpSocket* socket, const QString& account) {
+    // 查询发送给该用户的待处理好友申请
+    QSqlQuery friendRequestQuery(m_db);
+    friendRequestQuery.prepare("SELECT user_account, created_at FROM Friendships "
+                              "WHERE friend_account = :account AND status = 'pending' "
+                              "ORDER BY created_at ASC");
+    friendRequestQuery.bindValue(":account", account);
+
+    int requestCount = 0;
+    if (friendRequestQuery.exec()) {
+        while (friendRequestQuery.next()) {
+            QString fromAccount = friendRequestQuery.value("user_account").toString();
+            QString timestamp = friendRequestQuery.value("created_at").toString();
+
+            // 获取发送者用户名
+            QSqlQuery senderQuery(m_db);
+            senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+            senderQuery.bindValue(":account", fromAccount);
+
+            QString fromUsername = fromAccount; // 默认值
+            if (senderQuery.exec() && senderQuery.next()) {
+                fromUsername = senderQuery.value("username").toString();
+            }
+
+            // 构建好友申请通知
+            QJsonObject friendRequestNotification;
+            friendRequestNotification["type"] = "friendRequest";
+            friendRequestNotification["status"] = "offlineRequest";
+            friendRequestNotification["fromAccount"] = fromAccount;
+            friendRequestNotification["fromUsername"] = fromUsername;
+            friendRequestNotification["toAccount"] = account;
+            friendRequestNotification["timestamp"] = timestamp;
+
+            sendResponse(socket, friendRequestNotification);
+            requestCount++;
+        }
+    }
+
+    if (requestCount > 0) {
+        qInfo() << "已推送离线好友申请给用户" << account << "：" << requestCount << "条申请";
+    }
+}
+
 // 初始化用户状态
 void ChatServer::initializeUserStatus(const QString& account) {
     QSqlQuery checkQuery(m_db);
@@ -932,3 +1181,330 @@ void ChatServer::initializeUserStatus(const QString& account) {
         updateUserOnlineStatus(account, true);
     }
 }
+
+// **辅助函数：处理获取好友申请请求的逻辑**
+void ChatServer::handleGetFriendRequests(QTcpSocket* socket, const QString& account) {
+    QJsonObject response;
+    response["type"] = "getFriendRequests";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证账号是否已登录
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != account) {
+        response["status"] = "error";
+        response["message"] = "获取好友申请失败：用户未登录或身份验证失败。";
+        sendResponse(socket, response);
+        qWarning() << "获取好友申请失败：身份验证失败：" << account;
+        return;
+    }
+
+    // 查询发送给该用户的待处理好友申请
+    QSqlQuery friendRequestQuery(m_db);
+    friendRequestQuery.prepare("SELECT user_account, created_at FROM Friendships "
+                              "WHERE friend_account = :account AND status = 'pending' "
+                              "ORDER BY created_at DESC");
+    friendRequestQuery.bindValue(":account", account);
+
+    QJsonArray requestsArray;
+    int requestCount = 0;
+
+    if (friendRequestQuery.exec()) {
+        while (friendRequestQuery.next()) {
+            QString fromAccount = friendRequestQuery.value("user_account").toString();
+            QString timestamp = friendRequestQuery.value("created_at").toString();
+
+            // 获取发送者用户名
+            QSqlQuery senderQuery(m_db);
+            senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+            senderQuery.bindValue(":account", fromAccount);
+
+            QString fromUsername = fromAccount; // 默认值
+            if (senderQuery.exec() && senderQuery.next()) {
+                fromUsername = senderQuery.value("username").toString();
+            }
+
+            // 检查发送者是否在线
+            bool isOnline = false;
+            for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+                if (it.value() == fromAccount && it.key()->state() == QAbstractSocket::ConnectedState) {
+                    isOnline = true;
+                    break;
+                }
+            }
+
+            // 构建好友申请信息
+            QJsonObject requestInfo;
+            requestInfo["fromAccount"] = fromAccount;
+            requestInfo["fromUsername"] = fromUsername;
+            requestInfo["timestamp"] = timestamp;
+            requestInfo["isOnline"] = isOnline;
+
+            requestsArray.append(requestInfo);
+            requestCount++;
+        }
+    } else {
+        response["status"] = "error";
+        response["message"] = "获取好友申请失败：数据库查询错误 - " + friendRequestQuery.lastError().text();
+        sendResponse(socket, response);
+        qCritical() << "获取好友申请失败：数据库错误：" << friendRequestQuery.lastError().text();
+        return;
+    }
+
+    // 构建成功响应
+    response["status"] = "success";
+    response["message"] = "成功获取好友申请列表";
+    response["requests"] = requestsArray;
+    response["requestCount"] = requestCount;
+
+    sendResponse(socket, response);
+    qInfo() << "已发送好友申请列表给用户" << account << "：共" << requestCount << "条申请";
+}
+
+// **辅助函数：处理接受好友申请请求的逻辑**
+void ChatServer::handleAcceptFriendRequest(QTcpSocket* socket, const QString& account, const QString& fromAccount) {
+    QJsonObject response;
+    response["type"] = "acceptFriendRequest";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证输入数据
+    if (account.isEmpty() || fromAccount.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "接受好友申请失败：账号和请求者账号不能为空。";
+        sendResponse(socket, response);
+        qWarning() << "接受好友申请失败：输入数据不完整";
+        return;
+    }
+
+    // 检查好友申请是否存在
+    QSqlQuery checkQuery(m_db);
+    checkQuery.prepare("SELECT status FROM Friendships WHERE "
+                      "user_account = :fromAccount AND friend_account = :account");
+    checkQuery.bindValue(":fromAccount", fromAccount);
+    checkQuery.bindValue(":account", account);
+
+    if (!checkQuery.exec() || !checkQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "接受好友申请失败：未找到相关请求。";
+        sendResponse(socket, response);
+        qWarning() << "接受好友申请失败：未找到请求记录，发送者：" << fromAccount << " 接收者：" << account;
+        return;
+    }
+
+    QString status = checkQuery.value("status").toString();
+    if (status != "pending") {
+        response["status"] = "error";
+        response["message"] = "接受好友申请失败：请求状态不正确。";
+        sendResponse(socket, response);
+        qWarning() << "接受好友申请失败：请求状态不正确，状态：" << status;
+        return;
+    }
+
+    // 更新好友关系为已接受
+    QSqlQuery updateQuery(m_db);
+    updateQuery.prepare("UPDATE Friendships SET status = 'accepted', updated_at = :timestamp "
+                       "WHERE user_account = :fromAccount AND friend_account = :account");
+    updateQuery.bindValue(":fromAccount", fromAccount);
+    updateQuery.bindValue(":account", account);
+    updateQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
+
+    if (!updateQuery.exec()) {
+        response["status"] = "error";
+        response["message"] = "接受好友申请失败：数据库错误 - " + updateQuery.lastError().text();
+        sendResponse(socket, response);
+        qCritical() << "接受好友申请失败：数据库错误：" << updateQuery.lastError().text();
+        return;
+    }
+
+    response["status"] = "success";
+    response["message"] = "已成功接受来自 " + fromAccount + " 的好友申请。";
+
+    // 如果申请发送者在线，推送好友关系更新通知
+    QTcpSocket* senderSocket = nullptr;
+    for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+        if (it.value() == fromAccount) {
+            senderSocket = it.key();
+            break;
+        }
+    }
+
+    if (senderSocket && senderSocket->state() == QAbstractSocket::ConnectedState) {
+        QJsonObject notification;
+        notification["type"] = "friendRequestResponse";
+        notification["status"] = "accepted";
+        notification["fromAccount"] = fromAccount;
+        notification["toAccount"] = account;
+        notification["message"] = "你的好友申请已被 " + account + " 接受";
+        notification["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+        sendResponse(senderSocket, notification);
+        qInfo() << "已推送好友申请被接受通知给申请发送者：" << fromAccount;
+    }
+
+    sendResponse(socket, response);
+    qInfo() << "已处理接受好友申请请求：" << fromAccount << " -> " << account;
+}
+
+// **辅助函数：处理拒绝好友申请请求的逻辑**
+void ChatServer::handleRejectFriendRequest(QTcpSocket* socket, const QString& account, const QString& fromAccount) {
+    QJsonObject response;
+    response["type"] = "rejectFriendRequest";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证输入数据
+    if (account.isEmpty() || fromAccount.isEmpty()) {
+        response["status"] = "error";
+        response["message"] = "拒绝好友申请失败：账号和请求者账号不能为空。";
+        sendResponse(socket, response);
+        qWarning() << "拒绝好友申请失败：输入数据不完整";
+        return;
+    }
+
+    // 检查好友申请是否存在
+    QSqlQuery checkQuery(m_db);
+    checkQuery.prepare("SELECT status FROM Friendships WHERE "
+                      "user_account = :fromAccount AND friend_account = :account");
+    checkQuery.bindValue(":fromAccount", fromAccount);
+    checkQuery.bindValue(":account", account);
+
+    if (!checkQuery.exec() || !checkQuery.next()) {
+        response["status"] = "error";
+        response["message"] = "拒绝好友申请失败：未找到相关请求。";
+        sendResponse(socket, response);
+        qWarning() << "拒绝好友申请失败：未找到请求记录，发送者：" << fromAccount << " 接收者：" << account;
+        return;
+    }
+
+    QString status = checkQuery.value("status").toString();
+    if (status != "pending") {
+        response["status"] = "error";
+        response["message"] = "拒绝好友申请失败：请求状态不正确。";
+        sendResponse(socket, response);
+        qWarning() << "拒绝好友申请失败：请求状态不正确，状态：" << status;
+        return;
+    }
+
+    // 删除好友申请记录
+    QSqlQuery deleteQuery(m_db);
+    deleteQuery.prepare("DELETE FROM Friendships WHERE "
+                       "user_account = :fromAccount AND friend_account = :account");
+    deleteQuery.bindValue(":fromAccount", fromAccount);
+    deleteQuery.bindValue(":account", account);
+
+    if (!deleteQuery.exec()) {
+        response["status"] = "error";
+        response["message"] = "拒绝好友申请失败：数据库错误 - " + deleteQuery.lastError().text();
+        sendResponse(socket, response);
+        qCritical() << "拒绝好友申请失败：数据库错误：" << deleteQuery.lastError().text();
+        return;
+    }
+
+    response["status"] = "success";
+    response["message"] = "已成功拒绝来自 " + fromAccount + " 的好友申请。";
+
+    // 如果申请发送者在线，推送好友申请被拒绝通知
+    QTcpSocket* senderSocket = nullptr;
+    for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+        if (it.value() == fromAccount) {
+            senderSocket = it.key();
+            break;
+        }
+    }
+
+    if (senderSocket && senderSocket->state() == QAbstractSocket::ConnectedState) {
+        QJsonObject notification;
+        notification["type"] = "friendRequestResponse";
+        notification["status"] = "rejected";
+        notification["fromAccount"] = fromAccount;
+        notification["toAccount"] = account;
+        notification["message"] = "你的好友申请已被 " + account + " 拒绝";
+        notification["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+        sendResponse(senderSocket, notification);
+        qInfo() << "已推送好友申请被拒绝通知给申请发送者：" << fromAccount;
+    }
+
+    sendResponse(socket, response);
+    qInfo() << "已处理拒绝好友申请请求：" << fromAccount << " -> " << account;
+}
+
+// **辅助函数：处理获取好友列表请求的逻辑**
+void ChatServer::handleGetFriendList(QTcpSocket* socket, const QString& account) {
+    QJsonObject response;
+    response["type"] = "getFriendList";
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 验证账号是否已登录
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != account) {
+        response["status"] = "error";
+        response["message"] = "获取好友列表失败：用户未登录或身份验证失败。";
+        sendResponse(socket, response);
+        qWarning() << "获取好友列表失败：身份验证失败：" << account;
+        return;
+    }
+
+    // 查询该用户的好友关系（双向查询）
+    QSqlQuery friendListQuery(m_db);
+    friendListQuery.prepare("SELECT DISTINCT "
+                           "CASE "
+                           "  WHEN user_account = :account THEN friend_account "
+                           "  ELSE user_account "
+                           "END AS friend_account "
+                           "FROM Friendships "
+                           "WHERE (user_account = :account OR friend_account = :account) "
+                           "AND status = 'accepted' "
+                           "ORDER BY friend_account");
+    friendListQuery.bindValue(":account", account);
+
+    QJsonArray friendsArray;
+    int friendCount = 0;
+
+    if (friendListQuery.exec()) {
+        while (friendListQuery.next()) {
+            QString friendAccount = friendListQuery.value("friend_account").toString();
+
+            // 获取好友用户名
+            QSqlQuery friendInfoQuery(m_db);
+            friendInfoQuery.prepare("SELECT username FROM Users WHERE account = :account");
+            friendInfoQuery.bindValue(":account", friendAccount);
+
+            QString friendUsername = friendAccount; // 默认值
+            if (friendInfoQuery.exec() && friendInfoQuery.next()) {
+                friendUsername = friendInfoQuery.value("username").toString();
+            }
+
+            // 检查好友是否在线
+            bool isOnline = false;
+            for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+                if (it.value() == friendAccount && it.key()->state() == QAbstractSocket::ConnectedState) {
+                    isOnline = true;
+                    break;
+                }
+            }
+
+            // 构建好友信息
+            QJsonObject friendInfo;
+            friendInfo["account"] = friendAccount;
+            friendInfo["username"] = friendUsername;
+            friendInfo["isOnline"] = isOnline;
+            // TODO: 可以在这里添加头像、个性签名等信息
+
+            friendsArray.append(friendInfo);
+            friendCount++;
+        }
+    } else {
+        response["status"] = "error";
+        response["message"] = "获取好友列表失败：数据库查询错误 - " + friendListQuery.lastError().text();
+        sendResponse(socket, response);
+        qCritical() << "获取好友列表失败：数据库错误：" << friendListQuery.lastError().text();
+        return;
+    }
+
+    // 构建成功响应
+    response["status"] = "success";
+    response["message"] = "成功获取好友列表";
+    response["friends"] = friendsArray;
+    response["friendCount"] = friendCount;
+
+    sendResponse(socket, response);
+    qInfo() << "已发送好友列表给用户" << account << "：共" << friendCount << "个好友";
+}
+
