@@ -13,6 +13,8 @@
 #include <QJsonObject>    // 用于 JSON 对象处理
 #include <QDebug>         // 用于调试输出
 #include <QDateTime>      //
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
 
 class ChatServer : public QObject {
     Q_OBJECT // 启用 Qt 的元对象系统，让类可以使用信号和槽
@@ -39,12 +41,18 @@ private slots:
     // 槽函数：处理套接字发生的错误
     void onErrorOccurred(QAbstractSocket::SocketError socketError);
 
+    // 槽函数：处理 AI 接口的网络响应
+    void onAiApiReply(QNetworkReply* reply);
+    void onAiAskReply();
+
 private:
     QTcpServer *m_tcpServer;           // 用于监听客户端连接的服务器对象
     QHash<QTcpSocket*, quint32> m_clientBlockSizes; // 存储每个客户端的数据包大小
     QHash<QTcpSocket*, QString> m_socketToAccount; // socket到账号的映射
 
     QSqlDatabase m_db; // 数据库连接对象
+
+    QNetworkAccessManager* m_networkManager;
 
     // **新增辅助函数声明**
     // 用于获取客户端的 IP:Port 信息
@@ -110,6 +118,10 @@ private:
 
     // 初始化用户状态（登录时调用）
     void initializeUserStatus(const QString& account);
+
+    //ai接口
+    void handleAiAsk(QTcpSocket* socket, const QString& account, const QString& question);
+
 };
 
 #endif // CHAT_SERVER_H

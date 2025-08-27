@@ -13,7 +13,7 @@
 // 构造函数：初始化成员变量，连接信号和槽
 ChatServer::ChatServer(QObject *parent)
     : QObject(parent),
-      m_tcpServer(new QTcpServer(this)) // 初始化 m_tcpServer
+      m_tcpServer(new QTcpServer(this))// 初始化 m_tcpServer
 {
     // **数据库连接设置**
     m_db = QSqlDatabase::addDatabase("QSQLITE"); // 添加 SQLite 驱动
@@ -148,8 +148,15 @@ ChatServer::ChatServer(QObject *parent)
     }
     //数据库设置结束
 
+    // 初始化 m_networkManager
+    m_networkManager = new QNetworkAccessManager(this);
+
     // 将 m_tcpServer 发出的 newConnection() 信号连接到 ChatServer 的 onNewConnection() 槽函数
     connect(m_tcpServer, &QTcpServer::newConnection, this, &ChatServer::onNewConnection);
+
+    // 将 m_networkManager 发出的 finished() 信号连接到 ChatServer 的 onAiApiReply() 槽函数
+    connect(m_networkManager, &QNetworkAccessManager::finished, this, &ChatServer::onAiApiReply);
+
     qInfo() << "ChatServer initialized.";
 }
 
@@ -277,6 +284,9 @@ void ChatServer::onReadyRead() {
             } else if (chatType == "public"){
                 handleChatMessage(senderSocket, account, request["content"].toString());
             }
+            else if (chatType == "ai") {
+                handleAiAsk(senderSocket, account, request["question"].toString());
+            }
         }
         else if (requestType == "updateUserInfo") {
             QString nickname = request["nickname"].toString();
@@ -363,6 +373,80 @@ void ChatServer::onErrorOccurred(QAbstractSocket::SocketError socketError) {
                 << senderSocket->errorString() << " (错误码：" << socketError << ")";
 }
 
+void ChatServer::onAiApiReply(QNetworkReply* reply) {
+    QTcpSocket* socket = (QTcpSocket*)reply->request().attribute(QNetworkRequest::User).value<void*>();
+    if (!socket) return;
+
+    QJsonObject response;
+    response["type"] = "aiAnswer";
+    response["status"] = "success";
+    response["account"] = socket->property("aiAskAccount").toString();
+
+    if (reply->error() == QNetworkReply::NoError) {
+        QByteArray respData = reply->readAll();
+        QJsonDocument doc = QJsonDocument::fromJson(respData);
+        QString aiAnswer;
+        if (doc.isObject()) {
+            // 解析 DeepSeek 返回的内容
+            QJsonObject obj = doc.object();
+            QJsonArray choices = obj["choices"].toArray();
+            if (!choices.isEmpty()) {
+                aiAnswer = choices[0].toObject()["message"].toObject()["content"].toString();
+            }
+        }
+        qInfo() << "AI API回复已收到，状态：" << reply->error() << "，内容：" << reply->readAll();
+        response["answer"] = aiAnswer;
+    } else {
+        response["status"] = "error";
+        response["message"] = "AI服务请求失败：" + reply->errorString();
+    }
+    sendResponse(socket, response);
+    reply->deleteLater();
+}
+
+void ChatServer::onAiAskReply() {
+    // 获取信号发送者，即 QNetworkReply 对象
+    QNetworkReply* reply = qobject_cast<QNetworkReply*>(sender());
+    if (!reply) {
+        return;
+    }
+
+    // 从 QNetworkReply 对象中获取之前保存的 socket 指针
+    QTcpSocket* socket = static_cast<QTcpSocket*>(reply->property("aiAskSocket").value<void*>());
+
+    // 检查是否有网络错误
+    if (reply->error() != QNetworkReply::NoError) {
+        qCritical() << "AI API请求失败: " << reply->errorString();
+        // 如果需要，可以向客户端发送错误信息
+    } else {
+        // 读取并解析 API 返回的 JSON 数据
+        QByteArray responseData = reply->readAll();
+        QJsonDocument jsonResponse = QJsonDocument::fromJson(responseData);
+        QJsonObject responseObject = jsonResponse.object();
+
+        // 提取 AI 的回答内容
+        QString aiResponseContent;
+        // 根据 DeepSeek API 的JSON格式，安全地提取 "choices" -> "message" -> "content"
+        QJsonArray choices = responseObject["choices"].toArray();
+        if (!choices.isEmpty()) {
+            QJsonObject firstChoice = choices.at(0).toObject();
+            QJsonObject message = firstChoice["message"].toObject();
+            aiResponseContent = message["content"].toString();
+        }
+
+        qInfo() << "成功获取AI回答: " << aiResponseContent;
+
+        // 构造一个响应数据包并发送回客户端
+        QJsonObject response;
+        response["type"] = "aiResponse"; // 或其他你定义好的类型
+        response["status"] = "success";
+        response["content"] = aiResponseContent;
+        sendResponse(socket, response);
+    }
+
+    // 释放 QNetworkReply 对象，避免内存泄漏
+    reply->deleteLater();
+}
 
 // **辅助函数：获取客户端的 IP:Port 信息**
 QString ChatServer::getPeerInfo(QTcpSocket* socket) const {
@@ -1508,3 +1592,30 @@ void ChatServer::handleGetFriendList(QTcpSocket* socket, const QString& account)
     qInfo() << "已发送好友列表给用户" << account << "：共" << friendCount << "个好友";
 }
 
+void ChatServer::handleAiAsk(QTcpSocket* socket, const QString& account, const QString& question) {
+    qInfo() << "AI问答请求已收到：" << account << question;
+    // 构造 DeepSeek API 请求
+    QUrl url("https://api.deepseek.com/chat/completions"); // 替换为实际API地址
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Authorization", "Bearer sk-08852504a8714c60a1351fb4f974bc51"); // 替换为你的API密钥
+
+    QJsonObject payload;
+    payload["model"] = "deepseek-chat"; // 根据API文档填写
+    QJsonArray messages;
+    QJsonObject userMsg;
+    userMsg["role"] = "user";
+    userMsg["content"] = question;
+    messages.append(userMsg);
+    payload["messages"] = messages;
+
+    QByteArray data = QJsonDocument(payload).toJson();
+
+    //获取 QNetworkReply 对象**
+    QNetworkReply* reply = m_networkManager->post(request, data);
+
+    //将 socket 指针作为属性存储到 reply 中**
+    reply->setProperty("aiAskSocket", QVariant::fromValue((void*)socket));
+
+    connect(reply, &QNetworkReply::finished, this, &ChatServer::onAiAskReply);
+}
