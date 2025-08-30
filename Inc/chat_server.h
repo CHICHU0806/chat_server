@@ -71,7 +71,7 @@ private:
     void handleLoginRequest(QTcpSocket* socket, const QString& account, const QString& password);
 
     // 处理聊天消息请求的逻辑
-    void handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content);
+    void handlePublicChatMessage(QTcpSocket* socket, const QString& account, const QString& content);
 
     // 处理私聊
     void handlePrivateChatMessage(QTcpSocket* socket, const QString& senderAccount, const QString& content, const QString& targetAccount);

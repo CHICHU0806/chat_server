@@ -282,7 +282,7 @@ void ChatServer::onReadyRead() {
             if (chatType == "private") {
                 handlePrivateChatMessage(senderSocket, account, request["content"].toString(), targetAccount);
             } else if (chatType == "public"){
-                handleChatMessage(senderSocket, account, request["content"].toString());
+                handlePublicChatMessage(senderSocket, account, request["content"].toString());
             }
             else if (chatType == "ai") {
                 handleAiAsk(senderSocket, account, request["question"].toString());
@@ -589,7 +589,7 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
 }
 
 // **辅助函数：处理聊天消息请求的逻辑**
-void ChatServer::handleChatMessage(QTcpSocket* socket, const QString& account, const QString& content) {
+void ChatServer::handlePublicChatMessage(QTcpSocket* socket, const QString& account, const QString& content) {
     // 验证输入数据
     if (account.isEmpty() || content.isEmpty()) {
         QJsonObject response;
