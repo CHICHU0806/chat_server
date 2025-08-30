@@ -43,6 +43,7 @@ private slots:
 
     // 槽函数：处理 AI 接口的网络响应
     void onAiApiReply(QNetworkReply* reply);
+    void onAiAskReply();
 
 private:
     QTcpServer *m_tcpServer;           // 用于监听客户端连接的服务器对象

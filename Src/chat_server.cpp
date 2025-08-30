@@ -404,6 +404,50 @@ void ChatServer::onAiApiReply(QNetworkReply* reply) {
     reply->deleteLater();
 }
 
+void ChatServer::onAiAskReply() {
+    // 获取信号发送者，即 QNetworkReply 对象
+    QNetworkReply* reply = qobject_cast<QNetworkReply*>(sender());
+    if (!reply) {
+        return;
+    }
+
+    // 从 QNetworkReply 对象中获取之前保存的 socket 指针
+    QTcpSocket* socket = static_cast<QTcpSocket*>(reply->property("aiAskSocket").value<void*>());
+
+    // 检查是否有网络错误
+    if (reply->error() != QNetworkReply::NoError) {
+        qCritical() << "AI API请求失败: " << reply->errorString();
+        // 如果需要，可以向客户端发送错误信息
+    } else {
+        // 读取并解析 API 返回的 JSON 数据
+        QByteArray responseData = reply->readAll();
+        QJsonDocument jsonResponse = QJsonDocument::fromJson(responseData);
+        QJsonObject responseObject = jsonResponse.object();
+
+        // 提取 AI 的回答内容
+        QString aiResponseContent;
+        // 根据 DeepSeek API 的JSON格式，安全地提取 "choices" -> "message" -> "content"
+        QJsonArray choices = responseObject["choices"].toArray();
+        if (!choices.isEmpty()) {
+            QJsonObject firstChoice = choices.at(0).toObject();
+            QJsonObject message = firstChoice["message"].toObject();
+            aiResponseContent = message["content"].toString();
+        }
+
+        qInfo() << "成功获取AI回答: " << aiResponseContent;
+
+        // 构造一个响应数据包并发送回客户端
+        QJsonObject response;
+        response["type"] = "aiResponse"; // 或其他你定义好的类型
+        response["status"] = "success";
+        response["content"] = aiResponseContent;
+        sendResponse(socket, response);
+    }
+
+    // 释放 QNetworkReply 对象，避免内存泄漏
+    reply->deleteLater();
+}
+
 // **辅助函数：获取客户端的 IP:Port 信息**
 QString ChatServer::getPeerInfo(QTcpSocket* socket) const {
     if (socket) {
@@ -530,7 +574,6 @@ void ChatServer::handleLoginRequest(QTcpSocket* socket, const QString& account, 
         m_socketToAccount.insert(socket, account);
 
         // 推送离线消息和离线好友申请
-        pushOfflineMessages(socket, account);
         pushOfflineFriendRequests(socket, account);
 
         qInfo() << "登录成功：" << username << "(" << account << ") 来自 [" << getPeerInfo(socket) << "]";
@@ -960,22 +1003,24 @@ void ChatServer::handleAddFriendRequest(QTcpSocket* socket, const QJsonObject& r
 }
 
 // 保存消息到数据库
-void ChatServer::saveMessageToDatabase(const QString& senderAccount, const QString& receiverAccount,
-                                     const QString& content, const QString& messageType) {
-    QSqlQuery insertQuery(m_db);
-    insertQuery.prepare("INSERT INTO Messages (sender_account, receiver_account, content, message_type, timestamp) "
-                       "VALUES (:sender, :receiver, :content, :type, :timestamp)");
+void ChatServer::saveMessageToDatabase(const QString& senderAccount, const QString& receiverAccount, const QString& content, const QString& messageType) {
+    QSqlQuery query(m_db);
+    query.prepare("INSERT INTO Messages (sender_account, receiver_account, content, message_type, timestamp, is_read) "
+                  "VALUES (:sender, :receiver, :content, :messageType, :timestamp, :isRead)");
+    query.bindValue(":sender", senderAccount);
+    query.bindValue(":receiver", receiverAccount);
+    query.bindValue(":content", content);
+    query.bindValue(":messageType", messageType);
+    query.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
 
-    insertQuery.bindValue(":sender", senderAccount);
-    insertQuery.bindValue(":receiver", receiverAccount.isEmpty() ? QVariant() : receiverAccount);
-    insertQuery.bindValue(":content", content);
-    insertQuery.bindValue(":type", messageType);
-    insertQuery.bindValue(":timestamp", QDateTime::currentDateTime().toString(Qt::ISODate));
-
-    if (!insertQuery.exec()) {
-        qCritical() << "保存消息到数据库失败：" << insertQuery.lastError().text();
+    if (messageType == "private") {
+        query.bindValue(":isRead", 0);
     } else {
-        qDebug() << "消息已保存到数据库：" << messageType << "类型，发送者：" << senderAccount;
+        query.bindValue(":isRead", 1);
+    }
+
+    if (!query.exec()) {
+        qCritical() << "保存消息到数据库失败：" << query.lastError().text();
     }
 }
 
@@ -1044,6 +1089,8 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
     }
 
     QJsonArray allOfflineMessages;
+    int publicMsgCount = 0;
+    int privateMsgCount = 0;
 
     // 查询离线期间的公共消息
     QSqlQuery publicMsgQuery(m_db);
@@ -1071,16 +1118,19 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
 
             // 构建离线消息 JSON 对象
             QJsonObject offlineMessage;
-            offlineMessage["type"] = "offline_messages";
+            offlineMessage["type"] = "chatMessage";
             offlineMessage["status"] = "offline_broadcast";
             offlineMessage["sender"] = senderAccount;
             offlineMessage["username"] = senderUsername;
             offlineMessage["content"] = content;
             offlineMessage["timestamp"] = timestamp;
 
-            // *** 关键改进：将消息添加到数组中，而不是立即发送 ***
             allOfflineMessages.append(offlineMessage);
+            publicMsgCount++; // 在循环中计数
         }
+        qDebug() << "找到" << publicMsgCount << "条离线公共消息。";
+    }else {
+        qWarning() << "公共离线消息查询失败: " << publicMsgQuery.lastError().text();
     }
 
     // 查询离线期间的私聊消息（接收的）
@@ -1111,7 +1161,7 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
 
             // 构建离线私聊消息 JSON 对象
             QJsonObject offlineMessage;
-            offlineMessage["type"] = "offline_messages";
+            offlineMessage["type"] = "chatMessage";
             offlineMessage["status"] = "offline_private";
             offlineMessage["sender"] = senderAccount;
             offlineMessage["username"] = senderUsername;
@@ -1119,10 +1169,14 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
             offlineMessage["content"] = content;
             offlineMessage["timestamp"] = timestamp;
 
-            // *** 关键改进：将消息添加到数组中，而不是立即发送 ***
             allOfflineMessages.append(offlineMessage);
+            privateMsgCount++; // 在循环中计数
         }
+        qDebug() << "找到" << privateMsgCount  << "条离线私聊消息。";
+    }else {
+        qWarning() << "私聊离线消息查询失败: " << privateMsgQuery.lastError().text();
     }
+
 
     if (!allOfflineMessages.isEmpty()) {
         QJsonObject offlineResponse;
@@ -1131,6 +1185,16 @@ void ChatServer::pushOfflineMessages(QTcpSocket* socket, const QString& account)
         offlineResponse["messages"] = allOfflineMessages; // 包含所有消息的数组
         sendResponse(socket, offlineResponse); // 只调用一次发送
         qInfo() << "已推送" << allOfflineMessages.size() << "条离线消息给用户" << account;
+    }
+
+    // 如果有离线私聊消息被发送，更新它们的已读状态
+    if (allOfflineMessages.size() > 0) {
+        QSqlQuery updateQuery(m_db);
+        updateQuery.prepare("UPDATE Messages SET is_read = 1 WHERE receiver_account = :account AND message_type = 'private' AND is_read = 0");
+        updateQuery.bindValue(":account", account);
+        if (!updateQuery.exec()) {
+            qCritical() << "更新离线私聊消息状态失败：" << updateQuery.lastError().text();
+        }
     }
 
     // 更新用户最后同步时间
