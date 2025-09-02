@@ -16,6 +16,23 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 
+// 文件传输状态结构体
+struct FileTransferInfo {
+    QString transferId;
+    QString fileName;
+    qint64 fileSize;
+    qint64 receivedSize;
+    QString senderAccount;
+    QString senderUsername;
+    QString chatType;
+    QString chatTarget;
+    QByteArray fileData;
+    QDateTime startTime;
+    bool isComplete;
+
+    FileTransferInfo() : fileSize(0), receivedSize(0), isComplete(false) {}
+};
+
 class ChatServer : public QObject {
     Q_OBJECT // 启用 Qt 的元对象系统，让类可以使用信号和槽
 
@@ -53,6 +70,9 @@ private:
     QSqlDatabase m_db; // 数据库连接对象
 
     QNetworkAccessManager* m_networkManager;
+
+    // 文件传输相关的成员变量
+    QHash<QString, FileTransferInfo> m_activeFileTransfers; // 活跃的文件传输信息
 
     // **新增辅助函数声明**
     // 用于获取客户端的 IP:Port 信息
@@ -118,6 +138,16 @@ private:
 
     // 初始化用户状态（登录时调用）
     void initializeUserStatus(const QString& account);
+
+    // 文件传输相关函数
+    void handleFileTransferRequest(QTcpSocket* socket, const QJsonObject& request);
+    void handleFileTransferStart(QTcpSocket* socket, const QJsonObject& request);
+    void handleFileTransferComplete(QTcpSocket* socket, const QJsonObject& request);
+    void handleFileChunk(QTcpSocket* socket, const QString& transferId, const QByteArray& chunkData);
+    void forwardFileTransferStart(const FileTransferInfo& transferInfo);
+    void forwardFileChunk(const QString& transferId, const QByteArray& chunkData);
+    void sendFileTransferError(QTcpSocket* socket, const QString& transferId, const QString& error);
+    void cleanupFileTransfer(const QString& transferId);
 
     //ai接口
     void handleAiAsk(QTcpSocket* socket, const QString& account, const QString& question);

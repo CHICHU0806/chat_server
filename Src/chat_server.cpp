@@ -255,6 +255,19 @@ void ChatServer::onReadyRead() {
         qDebug() << "DEBUG (" << getPeerInfo(senderSocket) << "): 原始 JSON 数据 (Hex):" << jsonData.toHex();
         qDebug() << "DEBUG (" << getPeerInfo(senderSocket) << "): 原始 JSON 数据 (UTF8):" << QString::fromUtf8(jsonData);
 
+        // 检查是否是文件数据块 (FILE_CHUNK:transferId:data)
+        if (jsonData.startsWith("FILE_CHUNK:")) {
+            QString dataStr = QString::fromUtf8(jsonData);
+            int firstColon = dataStr.indexOf(':', 11); // 跳过 "FILE_CHUNK:"
+            if (firstColon != -1) {
+                QString transferId = dataStr.mid(11, firstColon - 11);
+                QByteArray chunkData = jsonData.mid(firstColon + 1);
+                handleFileChunk(senderSocket, transferId, chunkData);
+                m_clientBlockSizes[senderSocket] = 0;
+                continue;
+            }
+        }
+
         QJsonDocument doc = QJsonDocument::fromJson(jsonData);
         if (doc.isNull() || !doc.isObject()) {
             qWarning() << "无法解析传入的 JSON 数据来自 " << getPeerInfo(senderSocket) << "。原始数据 (Hex):" << jsonData.toHex();
@@ -287,6 +300,9 @@ void ChatServer::onReadyRead() {
             else if (chatType == "ai") {
                 handleAiAsk(senderSocket, account, request["question"].toString());
             }
+        }
+        else if (requestType == "fileTransfer") {
+            handleFileTransferRequest(senderSocket, request);
         }
         else if (requestType == "updateUserInfo") {
             QString nickname = request["nickname"].toString();
@@ -717,14 +733,17 @@ void ChatServer::handlePrivateChatMessage(QTcpSocket* socket, const QString& sen
 
     // 找到目标用户的套接字并发送消息
     bool targetFound = false;
-    for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
+    for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
         QTcpSocket* clientSocket = it.key();
-        if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
-            // 这里需要一个方法来识别套接字对应的账号，暂时发送给所有在线用户
-            // 实际应用中需要维护套接字到账号的映射
+        QString clientAccount = it.value();
+
+        if (clientSocket &&
+            clientSocket->state() == QAbstractSocket::ConnectedState &&
+            clientAccount == targetAccount) { // 严格比较目标账号
             sendResponse(clientSocket, privateMessage);
             targetFound = true;
-        }
+            break; // 找到目标后立即退出循环
+            }
     }
 
     // 向发送者确认消息状态
@@ -1644,3 +1663,354 @@ void ChatServer::handleAiAsk(QTcpSocket* socket, const QString& account, const Q
 
     connect(reply, &QNetworkReply::finished, this, &ChatServer::onAiAskReply);
 }
+
+// 处理文件传输请求
+void ChatServer::handleFileTransferRequest(QTcpSocket* socket, const QJsonObject& request) {
+    QString action = request["action"].toString();
+
+    if (action == "start") {
+        handleFileTransferStart(socket, request);
+    } else if (action == "complete") {
+        handleFileTransferComplete(socket, request);
+    } else {
+        sendFileTransferError(socket, "", "未知的文件传输操作：" + action);
+    }
+}
+
+// 处理文件传输开始
+void ChatServer::handleFileTransferStart(QTcpSocket* socket, const QJsonObject& request) {
+    QString transferId = request["transferId"].toString();
+    QString fileName = request["fileName"].toString();
+    qint64 fileSize = request["fileSize"].toInteger();
+    QString senderAccount = request["senderAccount"].toString();
+    QString chatType = request["chatType"].toString();
+    QString chatTarget = request["chatTarget"].toString();
+
+    // 验证输入数据
+    if (transferId.isEmpty() || fileName.isEmpty() || fileSize <= 0 || senderAccount.isEmpty()) {
+        sendFileTransferError(socket, transferId, "文件传输参数不完整");
+        return;
+    }
+
+    // 验证发送者是否已登录
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != senderAccount) {
+        sendFileTransferError(socket, transferId, "用户未登录或身份验证失败");
+        return;
+    }
+
+    // 获取发送者用户名
+    QSqlQuery senderQuery(m_db);
+    senderQuery.prepare("SELECT username FROM Users WHERE account = :account");
+    senderQuery.bindValue(":account", senderAccount);
+
+    if (!senderQuery.exec() || !senderQuery.next()) {
+        sendFileTransferError(socket, transferId, "发送者信息获取失败");
+        return;
+    }
+
+    QString senderUsername = senderQuery.value("username").toString();
+
+    // 创建文件传输信息
+    FileTransferInfo transferInfo;
+    transferInfo.transferId = transferId;
+    transferInfo.fileName = fileName;
+    transferInfo.fileSize = fileSize;
+    transferInfo.receivedSize = 0;
+    transferInfo.senderAccount = senderAccount;
+    transferInfo.senderUsername = senderUsername;
+    transferInfo.chatType = chatType;
+    transferInfo.chatTarget = chatTarget;
+    transferInfo.startTime = QDateTime::currentDateTime();
+    transferInfo.isComplete = false;
+
+    // 存储传输信息
+    m_activeFileTransfers[transferId] = transferInfo;
+
+    // 发送确认响应给发送者
+    QJsonObject response;
+    response["type"] = "fileTransfer";
+    response["action"] = "start";
+    response["status"] = "success";
+    response["transferId"] = transferId;
+    response["message"] = "文件传输已开始";
+    sendResponse(socket, response);
+
+    // 转发文件传输开始通知给目标用户
+    forwardFileTransferStart(transferInfo);
+
+    qInfo() << "文件传输开始：" << senderUsername << "(" << senderAccount << ") -> "
+            << chatTarget << ", 文件：" << fileName << ", 大小：" << fileSize << " bytes";
+}
+
+// 处理文件传输完成
+void ChatServer::handleFileTransferComplete(QTcpSocket* socket, const QJsonObject& request) {
+    QString transferId = request["transferId"].toString();
+
+    if (!m_activeFileTransfers.contains(transferId)) {
+        sendFileTransferError(socket, transferId, "未找到对应的文件传输记录");
+        return;
+    }
+
+    FileTransferInfo& transferInfo = m_activeFileTransfers[transferId];
+
+    // 验证传输是否完整
+    if (transferInfo.receivedSize != transferInfo.fileSize) {
+        QString errorMsg = QString("文件传输不完整：期望 %1 bytes，实际接收 %2 bytes")
+                          .arg(transferInfo.fileSize).arg(transferInfo.receivedSize);
+        sendFileTransferError(socket, transferId, errorMsg);
+        cleanupFileTransfer(transferId);
+        return;
+    }
+
+    // 标记传输完成
+    transferInfo.isComplete = true;
+
+    // 发送完成确认给发送者
+    QJsonObject response;
+    response["type"] = "fileTransfer";
+    response["action"] = "complete";
+    response["status"] = "success";
+    response["transferId"] = transferId;
+    response["message"] = "文件传输完成";
+    sendResponse(socket, response);
+
+    // 转发完整文件给目标用户
+    if (transferInfo.chatType == "private") {
+        // 私聊文件传输
+        for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+            if (it.value() == transferInfo.chatTarget) {
+                QTcpSocket* targetSocket = it.key();
+
+                QJsonObject fileMessage;
+                fileMessage["type"] = "fileMessage";
+                fileMessage["transferId"] = transferId;
+                fileMessage["fileName"] = transferInfo.fileName;
+                fileMessage["fileSize"] = transferInfo.fileSize;
+                fileMessage["senderAccount"] = transferInfo.senderAccount;
+                fileMessage["senderUsername"] = transferInfo.senderUsername;
+                fileMessage["chatType"] = transferInfo.chatType;
+                fileMessage["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+                sendResponse(targetSocket, fileMessage);
+
+                // 发送文件数据
+                QByteArray dataBlock;
+                QDataStream out(&dataBlock, QIODevice::WriteOnly);
+                out.setVersion(QDataStream::Qt_6_0);
+
+                QString fileDataPrefix = QString("FILE_DATA:%1:").arg(transferId);
+                QByteArray prefixedData = fileDataPrefix.toUtf8() + transferInfo.fileData;
+
+                out << (quint32)0;
+                out << prefixedData;
+                out.device()->seek(0);
+                out << (quint32)(dataBlock.size() - sizeof(quint32));
+
+                targetSocket->write(dataBlock);
+                targetSocket->flush();
+
+                qInfo() << "文件已发送给目标用户：" << transferInfo.chatTarget;
+                break;
+            }
+        }
+    } else if (transferInfo.chatType == "public") {
+        // 公共文件传输（广播给所有在线用户）
+        QJsonObject fileMessage;
+        fileMessage["type"] = "fileMessage";
+        fileMessage["transferId"] = transferId;
+        fileMessage["fileName"] = transferInfo.fileName;
+        fileMessage["fileSize"] = transferInfo.fileSize;
+        fileMessage["senderAccount"] = transferInfo.senderAccount;
+        fileMessage["senderUsername"] = transferInfo.senderUsername;
+        fileMessage["chatType"] = transferInfo.chatType;
+        fileMessage["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+        // 广播文件消息给所有在线用户
+        for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
+            QTcpSocket* clientSocket = it.key();
+            if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
+                sendResponse(clientSocket, fileMessage);
+
+                // 发送文件数据
+                QByteArray dataBlock;
+                QDataStream out(&dataBlock, QIODevice::WriteOnly);
+                out.setVersion(QDataStream::Qt_6_0);
+
+                QString fileDataPrefix = QString("FILE_DATA:%1:").arg(transferId);
+                QByteArray prefixedData = fileDataPrefix.toUtf8() + transferInfo.fileData;
+
+                out << (quint32)0;
+                out << prefixedData;
+                out.device()->seek(0);
+                out << (quint32)(dataBlock.size() - sizeof(quint32));
+
+                clientSocket->write(dataBlock);
+                clientSocket->flush();
+            }
+        }
+
+        qInfo() << "文件已广播给所有在线用户";
+    }
+
+    // 保存文件传输记录到数据库（可选）
+    saveMessageToDatabase(transferInfo.senderAccount,
+                         transferInfo.chatType == "private" ? transferInfo.chatTarget : "",
+                         QString("文件：%1 (%2 bytes)").arg(transferInfo.fileName).arg(transferInfo.fileSize),
+                         transferInfo.chatType == "private" ? "private" : "public");
+
+    // 清理传输记录
+    cleanupFileTransfer(transferId);
+
+    qInfo() << "文件传输完成：" << transferInfo.fileName << ", 传输时长："
+            << transferInfo.startTime.secsTo(QDateTime::currentDateTime()) << " 秒";
+}
+
+// 处理文件块数据
+void ChatServer::handleFileChunk(QTcpSocket* socket, const QString& transferId, const QByteArray& chunkData) {
+    if (!m_activeFileTransfers.contains(transferId)) {
+        sendFileTransferError(socket, transferId, "未找到对应的文件传输记录");
+        return;
+    }
+
+    FileTransferInfo& transferInfo = m_activeFileTransfers[transferId];
+
+    // 验证发送者
+    if (!m_socketToAccount.contains(socket) || m_socketToAccount[socket] != transferInfo.senderAccount) {
+        sendFileTransferError(socket, transferId, "文件块发送者验证失败");
+        return;
+    }
+
+    // 检查是否超出文件大小
+    if (transferInfo.receivedSize + chunkData.size() > transferInfo.fileSize) {
+        sendFileTransferError(socket, transferId, "文件块数据超出预期大小");
+        cleanupFileTransfer(transferId);
+        return;
+    }
+
+    // 添加数据块
+    transferInfo.fileData.append(chunkData);
+    transferInfo.receivedSize += chunkData.size();
+
+    // 发送进度确认
+    QJsonObject response;
+    response["type"] = "fileTransfer";
+    response["action"] = "chunk";
+    response["status"] = "success";
+    response["transferId"] = transferId;
+    response["receivedSize"] = transferInfo.receivedSize;
+    response["totalSize"] = transferInfo.fileSize;
+    response["progress"] = (double)transferInfo.receivedSize / transferInfo.fileSize * 100.0;
+    sendResponse(socket, response);
+
+    qDebug() << "文件块接收：" << transferId << ", 进度："
+             << transferInfo.receivedSize << "/" << transferInfo.fileSize
+             << " (" << response["progress"].toDouble() << "%)";
+}
+
+// 转发文件传输开始通知
+void ChatServer::forwardFileTransferStart(const FileTransferInfo& transferInfo) {
+    QJsonObject notification;
+    notification["type"] = "fileTransferNotification";
+    notification["action"] = "start";
+    notification["transferId"] = transferInfo.transferId;
+    notification["fileName"] = transferInfo.fileName;
+    notification["fileSize"] = transferInfo.fileSize;
+    notification["senderAccount"] = transferInfo.senderAccount;
+    notification["senderUsername"] = transferInfo.senderUsername;
+    notification["chatType"] = transferInfo.chatType;
+    notification["timestamp"] = transferInfo.startTime.toString(Qt::ISODate);
+
+    if (transferInfo.chatType == "private") {
+        // 发送给指定目标用户
+        for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+            if (it.value() == transferInfo.chatTarget) {
+                QTcpSocket* targetSocket = it.key();
+                sendResponse(targetSocket, notification);
+                qInfo() << "文件传输通知已发送给：" << transferInfo.chatTarget;
+                break;
+            }
+        }
+    } else if (transferInfo.chatType == "public") {
+        // 广播给所有在线用户
+        for (auto it = m_clientBlockSizes.begin(); it != m_clientBlockSizes.end(); ++it) {
+            QTcpSocket* clientSocket = it.key();
+            if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
+                sendResponse(clientSocket, notification);
+            }
+        }
+        qInfo() << "文件传输通知已广播给所有在线用户";
+    }
+}
+
+// 转发文件块数据（实时传输模式，可选实现）
+void ChatServer::forwardFileChunk(const QString& transferId, const QByteArray& chunkData) {
+    if (!m_activeFileTransfers.contains(transferId)) {
+        return;
+    }
+
+    const FileTransferInfo& transferInfo = m_activeFileTransfers[transferId];
+
+    // 构造文件块数据包
+    QString chunkPrefix = QString("FILE_CHUNK:%1").arg(transferId);
+    QByteArray prefixedChunk = chunkPrefix.toUtf8() + chunkData;
+
+    QByteArray dataBlock;
+    QDataStream out(&dataBlock, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << (quint32)0;
+    out << prefixedChunk;
+    out.device()->seek(0);
+    out << (quint32)(dataBlock.size() - sizeof(quint32));
+
+    if (transferInfo.chatType == "private") {
+        // 发送给指定目标用户
+        for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+            if (it.value() == transferInfo.chatTarget) {
+                QTcpSocket* targetSocket = it.key();
+                targetSocket->write(dataBlock);
+                targetSocket->flush();
+                break;
+            }
+        }
+    } else if (transferInfo.chatType == "public") {
+        // 广播给所有在线用户（除了发送者）
+        for (auto it = m_socketToAccount.begin(); it != m_socketToAccount.end(); ++it) {
+            if (it.value() != transferInfo.senderAccount) {
+                QTcpSocket* clientSocket = it.key();
+                if (clientSocket && clientSocket->state() == QAbstractSocket::ConnectedState) {
+                    clientSocket->write(dataBlock);
+                    clientSocket->flush();
+                }
+            }
+        }
+    }
+}
+
+// 发送文件传输错误
+void ChatServer::sendFileTransferError(QTcpSocket* socket, const QString& transferId, const QString& error) {
+    QJsonObject response;
+    response["type"] = "fileTransfer";
+    response["status"] = "error";
+    response["transferId"] = transferId;
+    response["message"] = error;
+    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    sendResponse(socket, response);
+    qWarning() << "文件传输错误：" << error << "传输ID：" << transferId;
+
+    // 如果有有效的传输ID，清理传输记录
+    if (!transferId.isEmpty() && m_activeFileTransfers.contains(transferId)) {
+        cleanupFileTransfer(transferId);
+    }
+}
+
+// 清理文件传输
+void ChatServer::cleanupFileTransfer(const QString& transferId) {
+    if (m_activeFileTransfers.contains(transferId)) {
+        FileTransferInfo transferInfo = m_activeFileTransfers[transferId];
+        m_activeFileTransfers.remove(transferId);
+
+        qInfo() << "已清理文件传输记录：" << transferId << ", 文件：" << transferInfo.fileName;
+    }
+}
+
