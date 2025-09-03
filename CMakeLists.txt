@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.31)
 project(chat_server)
 
+#[[
 set(Qt6_DIR "C:/Qt/6.9.1/mingw_64/lib/cmake/Qt6")  # 注意斜杠方向
 list(APPEND CMAKE_PREFIX_PATH "C:/Qt/6.9.1/mingw_64")
+]]
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_AUTOMOC ON)
@@ -28,6 +30,7 @@ target_link_libraries(chat_server
         Qt6::Network
         Qt6::Sql
 )
+#[[
 
 if (WIN32 AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(DEBUG_SUFFIX)
@@ -57,3 +60,4 @@ if (WIN32 AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
                 "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
     endforeach (QT_LIB)
 endif ()
+]]
